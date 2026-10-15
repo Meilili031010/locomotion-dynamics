@@ -4,21 +4,20 @@ import time
 import numpy as np
 
 MODEL_PATH = "/home/mel/ws/unitree_ws/src/unitree_mujoco/unitree_robots/go2/scene.xml"
-SIM_TIME = 3.0
-KP, KD = 40.0, 1.0
+SIM_TIME = 10.0
+KP, KD = 4.0, 1.0
 
 m = mujoco.MjModel.from_xml_path(MODEL_PATH)
 d = mujoco.MjData(m)
 
-# 站立姿态：优先使用 keyframe，没有则使用模型默认值
 if m.nkey > 0:
     mujoco.mj_resetDataKeyframe(m, d, 0)
-    print("使用 keyframe 0 作为初始姿态")
+    print("Frame 0 as the reference frame")
 else:
     mujoco.mj_resetData(m, d)
-    print("没有 keyframe，使用默认姿态")
+    print("No keyframe, reset to default pose")
 
-q_target = d.qpos.copy()           # 站立目标 = 初始姿态
+q_target = d.qpos.copy()
 d.qpos[:] = q_target
 mujoco.mj_forward(m, d)
 
@@ -31,13 +30,11 @@ for i in range(m.nu):
     act_dadr.append(m.jnt_dofadr[jid])
 
 is_position = all(m.actuator_biastype[i] == 1 for i in range(m.nu))
-print("控制方式:", "位置型 actuator（写目标角度）" if is_position else "力矩型（自算 PD）")
+print("Control mode:", "Position-based actuator (write target angles)" if is_position else "Torque-based (compute PD internally)")
 
 def compute_ctrl():
     if is_position:
-        # 位置型：ctrl 就是目标关节角
         return np.array([q_target[a] for a in act_qadr])
-    # 力矩型：tau = KP*(q_target - q) - KD*qd
     tau = np.zeros(m.nu)
     for i in range(m.nu):
         q = d.qpos[act_qadr[i]]
@@ -46,17 +43,11 @@ def compute_ctrl():
     return tau
 
 steps = int(SIM_TIME / m.opt.timestep)
-# for k in range(steps):
-#     d.ctrl[:] = compute_ctrl()
-#     mujoco.mj_step(m, d)
-
-#     if k % int(0.5 / m.opt.timestep) == 0:
-#         base_h = d.qpos[2]
-#         joint_err = np.max(np.abs(d.qpos[7:] - q_target[7:]))
-        # print(f"t={d.time:5.2f}s  base_z={base_h:.3f}  max_joint_err={joint_err:.3f}  ncon={d.ncon}")
 
 SYNC_EVERY = 10
-with mujoco.viewer.launch_passive(m, d) as viewer:
+viewer = mujoco.viewer.launch_passive(m, d)
+
+try:
     k = 0
     while viewer.is_running() and d.time < SIM_TIME:
         t0 = time.time()
@@ -67,10 +58,14 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
         if k % SYNC_EVERY == 0:
             viewer.sync()
 
-        # 按实时速度运行，避免仿真过快
         dt = m.opt.timestep - (time.time() - t0)
         if dt > 0:
             time.sleep(dt)
         k += 1
+finally:
+    # 1. Explicitly notify the GLFW/EGL backend to close the window
+    viewer.close()
+    # 2. Allow any pending Wayland/EGL events to flush before Python finalizes
+    time.sleep(0.1)
 
-print("\n站立结束，最终基座位置:", d.qpos[0:3])
+print("\nFinished, base position:", d.qpos[0:3])
