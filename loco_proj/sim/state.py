@@ -5,7 +5,6 @@ from scipy.spatial.transform import Rotation as R
 LEGS = ["FL", "FR", "RL", "RR"]
 JOINTS = ["hip", "thigh", "calf"]
 
-
 class State:
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData):
         self.model = model
@@ -17,8 +16,12 @@ class State:
 
         # row = leg, col = hip/thigh/calf
         jids = [model.joint(f"{leg}_{j}_joint").id for leg in LEGS for j in JOINTS]
+        hids = [model.joint(f"{leg}_hip_joint").id for leg in LEGS]
         self.qadr = model.jnt_qposadr[jids]
         self.vadr = model.jnt_dofadr[jids]
+
+        # hip position in body-fixed frame
+        self.hip_b = data.xanchor[hids]
 
     @property
     def base_pose(self):
@@ -69,13 +72,15 @@ class State:
         return self.foot_jacobians[:, :3, :] @ self.data.qvel
 
 # Test
-GO2_XML = "/home/mel/ws/unitree_ws/src/unitree_mujoco/unitree_robots/go2/go2.xml"
-model = mujoco.MjModel.from_xml_path(GO2_XML)
-data = mujoco.MjData(model)
-mujoco.mj_resetDataKeyframe(model, data, 0)
-mujoco.mj_forward(model, data)
+if __name__ == "__main__":
+    GO2_XML = "/home/mel/ws/unitree_ws/src/unitree_mujoco/unitree_robots/go2/go2.xml"
+    model = mujoco.MjModel.from_xml_path(GO2_XML)
+    data = mujoco.MjData(model)
+    mujoco.mj_resetDataKeyframe(model, data, 0)
+    mujoco.mj_forward(model, data)
 
-s = State(model, data)
-print(s.base_pose)
-print(s.foot_positions)
-print(data.qfrc_bias)
+    s = State(model, data)
+    # print(s.base_pose)
+    # print(s.foot_positions)
+    # print(data.qfrc_bias)
+    print(s.hip_b.shape)

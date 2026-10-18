@@ -1,6 +1,10 @@
 from dataclasses import dataclass
 import numpy as np
 
+"""
+    In MIT Cheetah 3, the velocities for both real and cmd are in world frame
+"""
+
 @dataclass
 class SwingTrajectoryConfig:
     step_height: float = 0.08
@@ -29,7 +33,7 @@ def p_rot(v_cmd: np.ndarray, r_hip: np.ndarray, t_stance: float) -> np.ndarray:
 
 
 def p_terrain(coords: np.ndarray) -> np.ndarray:
-    return np.array([0.0, 0.0, 0.0])
+    return np.array([0.0, 0.0, 0.022])
 
 
 def compute_foot_placement(
@@ -52,7 +56,12 @@ def compute_foot_placement(
     return target_xy + target_z
 
 
-def cubic_bezier(p0, p1, p2, p3, s):
+def cubic_bezier(
+        p0: np.ndarray, 
+        p1: np.ndarray, 
+        p2: np.ndarray, 
+        p3: np.ndarray, 
+        s) -> tuple[np.ndarray, np.ndarray]: 
     s = np.clip(s, 0.0, 1.0)
     pos = (1 - s)**3 * p0 + 3 * (1 - s)**2 * s * p1 + 3 * (1 - s) * s**2 * p2 + s**3 * p3
     dpos_ds = 3 * (1 - s)**2 * (p1 - p0) + 6 * (1 - s) * s * (p2 - p1) + 3 * s**2 * (p3 - p2)
