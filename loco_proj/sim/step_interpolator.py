@@ -1,3 +1,7 @@
+# [REVIEW NOTE] Legacy helpers, not used by the controller (swing_traj.py
+# replaces them). cubic_Bezier() below is incorrect: the z formula adds
+# (2s)^3 as a height (not a Bezier weight), and the xy curve uses p0 only in
+# the first term. Kept unchanged for reference.
 import numpy as np
 from numpy.polynomial import Polynomial
 from scipy.special import comb

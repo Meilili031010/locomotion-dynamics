@@ -3,6 +3,11 @@ import numpy as np
 
 LEGS = ["FL", "FR", "RL", "RR"]
 
+# [ADDED] Small offset used when converting time -> phase. Times built from an
+# integer step counter (k * dt) can land a hair below a sub-phase boundary
+# (e.g. 0.49999999 instead of 0.5) and pick the wrong table row.
+_PHASE_EPS = 1e-9
+
 
 @dataclass
 class GaitConfig:
@@ -44,7 +49,7 @@ class GaitScheduler:
             self.swing = tab > 0
             ends_b = np.broadcast_to(self.ends[:, None], tab.shape)
             if not np.all(tab[self.swing] == ends_b[self.swing]):
-                raise ValueError("Nonzero entries in each row must be the smae")
+                raise ValueError("Nonzero entries in each row must be the same")  # [FIXED] typo
 
         self.starts = np.concatenate([[0.0], self.ends[:-1]])
 
@@ -58,7 +63,7 @@ class GaitScheduler:
         """
             Normalized time
         """
-        return (t / self.T) % 1.0
+        return (t / self.T + _PHASE_EPS) % 1.0  # [CHANGED] + eps, see _PHASE_EPS
 
     def row(self, t: float) -> int:
         """
@@ -99,12 +104,23 @@ class GaitScheduler:
         d = self.ends - self.starts
         return float(d[~self.swing[:, leg]].sum() * self.T)
 
+    # ---- [ADDED] begin ----
+    def swing_duration(self, leg: int) -> float:
+        """Total swing time of one leg per gait cycle [s]."""
+        return self.T - self.stance_duration(leg)
+
+    def cycle_index(self, t: float) -> int:
+        """Number of completed gait cycles at time t (used for Poincare sections)."""
+        return int(np.floor(t / self.T + _PHASE_EPS))
+    # ---- [ADDED] end ----
+
     def contacts_horizon(self, t0: float, h: int, dt: float) -> np.ndarray:
         """
-
+            [ADDED doc] Contact table over the MPC horizon.
+            Returns (h, 4) bool, row k = contacts at time t0 + k*dt (True = stance).
         """
         times = t0 + dt * np.arange(h)
-        rows = np.searchsorted(self.ends, (times / self.T) % 1.0, side="right")
+        rows = np.searchsorted(self.ends, (times / self.T + _PHASE_EPS) % 1.0, side="right")  # [CHANGED] + eps
         return ~self.swing[rows]
 
     def update(self, t: float):

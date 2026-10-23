@@ -11,13 +11,33 @@ GRAVITY = -9.81
 
 @dataclass
 class MPC_Config:
-    dt: float = 1e-3
-    h: int = 30
-    mu: float = 0.5
-    fz_max: float = 45.43 + 23.7
+    # [CHANGED] dt 1e-3 -> 0.025, h 30 -> 20.
+    # Cheetah 3 uses MPC steps of ~25-40 ms and a horizon of about one gait
+    # cycle. 1 ms x 30 only looked 30 ms ahead (not even one footstep).
+    # 0.025 s divides the 0.25 s trot half-period, so contact switches line up
+    # with MPC steps. Horizon = 20 x 0.025 = 0.5 s = one trot cycle.
+    dt: float = 0.025
+    h: int = 20
+    # [CHANGED] 0.5 -> 0.28. MuJoCo's Go2 feet have friction 0.4 on an
+    # elliptic (round) cone. The MPC uses a friction *pyramid*, whose corners
+    # allow |f_xy| = sqrt(2) * mu * fz; the pyramid inside a 0.4 cone has
+    # mu = 0.4 / sqrt(2) ~ 0.28. With 0.5 the MPC asked for forces that slip.
+    mu: float = 0.28
+    # [CHANGED] fz_max was 45.43 + 23.7 (sum of joint torque limits, N*m, not a
+    # force). Go2 weighs ~149 N, so a trot pair carries ~75 N/leg at rest;
+    # 160 N leaves room for dynamic loading.
+    fz_max: float = 160.0
     fz_min: float = 0.0
-    Q_diag: np.ndarray = field(default_factory=lambda: np.ones(13))
-    R_diag: np.ndarray = field(default_factory=lambda: np.ones(12))
+    # [CHANGED] was all ones. Started from the MIT convexMPC weights, then tuned
+    # in sim for Go2 (state layout [p(3), rpy(3), v(3), w(3), g]). Gravity
+    # entry must have zero weight.
+    Q_diag: np.ndarray = field(default_factory=lambda: np.array(
+        [1.0, 1.0, 50.0,      # p
+         10.0, 10.0, 10.0,    # roll, pitch, yaw
+         10.0, 10.0, 1.0,     # v
+         0.1, 0.1, 1.0,       # w
+         0.0]))               # g
+    R_diag: np.ndarray = field(default_factory=lambda: np.full(12, 1e-5))  # [CHANGED] alpha ~ 1e-5 (Cheetah: 4e-5)
     zd: float = 0.27
 
 
@@ -38,6 +58,7 @@ def ref_gen(x0: np.ndarray, v_cmd_b: np.ndarray, cfg: MPC_Config) -> np.ndarray:
 
     Xs = np.zeros((13, h + 1))
     Xs[:, 0] = x0
+    Xs[IDX_G, 0] = GRAVITY  # [ADDED] x0 from a sensor/zeros may not carry the gravity state
 
     Xs[0, 1:] = x0[0] + np.cumsum(vx_w) * dt
     Xs[1, 1:] = x0[1] + np.cumsum(vy_w) * dt
