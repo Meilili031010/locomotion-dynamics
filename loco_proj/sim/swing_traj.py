@@ -1,17 +1,5 @@
-from dataclasses import dataclass
 import numpy as np
-
-"""
-    In MIT Cheetah 3, the velocities for both real and cmd are in world frame
-"""
-
-@dataclass
-class SwingTrajectoryConfig:
-    step_height: float = 0.08
-    t_swing: float = 0.25
-    touchdown_velocity: float = 0.
-    gravity: float = 9.81
-    k_fb: float = None
+from structs import SwingTrajectoryCfg, FootPlacementCfg
 
 
 def p_sym(v_base: np.ndarray, t_stance: float, heading: float = 0.0) -> np.ndarray:
@@ -53,33 +41,21 @@ def p_centrifugal(v_base: np.ndarray, v_cmd: np.ndarray, height: float,
 
 
 def compute_foot_placement(
-    p_hip: np.ndarray,
-    v_base: np.ndarray,
-    v_cmd: np.ndarray,
-    height: float,
-    r_hip: np.ndarray,
-    t_stance: float,
-    heading: float,
-    cfg: SwingTrajectoryConfig,
-    t_swing_remaining: float = 0.0,     # [ADDED]
-    use_centrifugal: bool = True,       # [ADDED]
+    footCfg: FootPlacementCfg,
+    swingCfg: SwingTrajectoryCfg
 ) -> np.ndarray:
     """
-    [ADDED doc] Cheetah 3 footstep heuristic, all vectors in world frame.
         p_hip   : current hip ("shoulder") position
         v_base  : current base velocity
         v_cmd   : [vx_cmd, vy_cmd, wz_cmd]   (world frame)
         r_hip   : hip offset from base, world frame (for the yaw term)
-    The hip is first moved to where it will be at touchdown
-    (p_hip + v_cmd * t_swing_remaining), as in the Cheetah software.
     """
-    # [ADDED] predict hip position at touchdown
-    p_hip_td = p_hip + np.array([v_cmd[0], v_cmd[1], 0.0]) * t_swing_remaining
+    p_hip_td = footCfg.p_hip + np.array([footCfg.v_cmd[0], footCfg.v_cmd[1], 0.0]) * footCfg.t_swing_remaining
 
-    p_s = p_sym(v_base, t_stance, heading)
-    p_f = p_fb(v_base, v_cmd, height, cfg.k_fb)
-    p_r = p_rot(v_cmd, r_hip, t_stance)
-    p_c = p_centrifugal(v_base, v_cmd, height, cfg.gravity) if use_centrifugal else 0.0  # [ADDED]
+    p_s = p_sym(footCfg.v_base, footCfg.t_stance, footCfg.heading)
+    p_f = p_fb(footCfg.v_base, footCfg.v_cmd, footCfg.height, swingCfg.k_fb)
+    p_r = p_rot(footCfg.v_cmd, footCfg.r_hip, footCfg.t_stance)
+    p_c = p_centrifugal(footCfg.v_base, footCfg.v_cmd, footCfg.height, swingCfg.gravity) if footCfg.use_centrifugal else 0.0  # [ADDED]
 
     target_xy = p_hip_td + p_s + p_f + p_r + p_c
     target_xy[2] = 0.0   # [FIXED] p_hip carries the hip height; it was added to the terrain z
@@ -110,12 +86,12 @@ def foot_trajectory(
     t_phase: float,
     p0: np.ndarray,
     pf: np.ndarray,
-    cfg: SwingTrajectoryConfig,
+    cfg: SwingTrajectoryCfg,
     t_swing: float = None,   # [ADDED] swing time from the gait; falls back to cfg.t_swing
 ) -> np.ndarray:
     """
-    [ADDED doc] Returns (3, 3): rows [pos; vel; acc], world frame.
-    cfg.touchdown_velocity is the z velocity at touchdown (negative = downward).
+        Returns (3, 3): rows [pos; vel; acc], world frame.
+        cfg.touchdown_velocity is the z velocity at touchdown (negative = downward).
     """
     T = cfg.t_swing if t_swing is None else t_swing   # [ADDED]
 

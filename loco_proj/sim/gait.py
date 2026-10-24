@@ -1,32 +1,5 @@
-from dataclasses import dataclass, field
 import numpy as np
-
-LEGS = ["FL", "FR", "RL", "RR"]
-
-# [ADDED] Small offset used when converting time -> phase. Times built from an
-# integer step counter (k * dt) can land a hair below a sub-phase boundary
-# (e.g. 0.49999999 instead of 0.5) and pick the wrong table row.
-_PHASE_EPS = 1e-9
-
-
-@dataclass
-class GaitConfig:
-    period: float = 0.5
-    """
-        table encoding:
-        0 denotes stance leg; values for nonzero element denote terminal time for swing leg
-    """
-    table: np.ndarray = field(default_factory=lambda: np.array([
-        [0, 0.5, 0.5, 0],   # FR、RL swing
-        [1, 0, 0, 1],   # FL、RR swing
-    ], dtype=float))
-
-    def __post_init__(self):
-        self.table = np.asarray(self.table, dtype=float)
-        assert self.period > 0
-        assert self.table.ndim == 2 and self.table.shape[1] == 4
-        assert np.all(self.table >= 0)
-
+from structs import GaitConfig, _PHASE_EPS, LEGS
 
 class GaitScheduler:
     def __init__(self, cfg: GaitConfig):
