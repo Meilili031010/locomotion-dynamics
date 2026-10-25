@@ -1,9 +1,8 @@
 import numpy as np
 import mujoco
 from scipy.spatial.transform import Rotation as R
+from structs import LEGS, JOINTS
 
-LEGS = ["FL", "FR", "RL", "RR"]
-JOINTS = ["hip", "thigh", "calf"]
 
 class State:
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData):
@@ -135,7 +134,7 @@ class State:
         w = np.linalg.solve(R @ I_body @ R.T, L)
         return np.concatenate([p, pose[3:], v, w, [gravity]])
 
-
+    # ---- [ADDED] ----
 def robot_params(model: mujoco.MjModel, key: int = 0) -> dict:
     """
     Single-rigid-body parameters for the MPC, computed at the keyframe pose.

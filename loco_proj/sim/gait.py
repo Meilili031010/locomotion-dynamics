@@ -1,8 +1,8 @@
 import numpy as np
-from structs import GaitConfig, _PHASE_EPS, LEGS
+from structs import GaitCfg, _PHASE_EPS, LEGS
 
 class GaitScheduler:
-    def __init__(self, cfg: GaitConfig):
+    def __init__(self, cfg: GaitCfg):
         self.cfg = cfg
         self.T = cfg.period
         tab = cfg.table
@@ -112,7 +112,7 @@ class GaitScheduler:
 
 
 if __name__ == "__main__":
-    cfg = GaitConfig()
+    cfg = GaitCfg()
     # cfg.table = np.array([[0,0,0,0]])
     gait = GaitScheduler(cfg)
     for t in np.arange(0.0, 0.5, 0.1):

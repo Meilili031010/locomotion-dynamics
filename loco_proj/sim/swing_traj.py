@@ -52,7 +52,7 @@ def compute_foot_placement(
     """
     p_hip_td = footCfg.p_hip + np.array([footCfg.v_cmd[0], footCfg.v_cmd[1], 0.0]) * footCfg.t_swing_remaining
 
-    p_s = p_sym(footCfg.v_base, footCfg.t_stance, footCfg.heading)
+    p_s = p_sym(footCfg.v_base, footCfg.t_stance, footCfg.yaw)   # [FIXED] FootPlacementCfg has no `heading`; it is `yaw`
     p_f = p_fb(footCfg.v_base, footCfg.v_cmd, footCfg.height, swingCfg.k_fb)
     p_r = p_rot(footCfg.v_cmd, footCfg.r_hip, footCfg.t_stance)
     p_c = p_centrifugal(footCfg.v_base, footCfg.v_cmd, footCfg.height, swingCfg.gravity) if footCfg.use_centrifugal else 0.0  # [ADDED]

@@ -1,71 +1,87 @@
-# Go2 trot: Cheetah 3 style convex MPC + Poincare analysis
+# Go2 trot: Cheetah 3 style convex MPC + Poincare / ROA analysis
 
-Run everything from this folder with the project venv:
+Run from this folder with the project venv (needs `osqp`):
 
 ```bash
 cd loco_proj/sim
-../.venv/bin/python run_trot.py --vx 0.5             # headless, 8 s, prints summary
-../.venv/bin/python run_trot.py --vx 0.5 --viewer    # MuJoCo viewer
-../.venv/bin/python run_trot.py --vx 0.6 --wz 0.5 --policy raibert --k 0.17
-../.venv/bin/python compare_policies.py              # Poincare comparison -> results/
-../.venv/bin/python compare_policies.py --vcmd 0.6 0 0.5 --extended
+../.venv/bin/python run.py --vx 0.5 --viewer
+../.venv/bin/python poincare_aug.py --vx 0.5 --compare raibert:k=0.03 raibert:k=0.17 openloop
+../.venv/bin/python roa.py --vx 0.5 --method grid --dims vx vy --bounds 1 1 --n 11
 ```
+Each program has `--help` with examples. Outputs go to `results/`.
 
-Needs `osqp` (installed into `.venv`: `pip install osqp`).
-
-## Pipeline (one controller tick = one 1 ms sim step)
+## Files
 
 ```
-gait.py            contacts, swing timing             (GaitScheduler)
-foot_placement.py  footholds for swing legs           (policy objects; swap these)
-ref_gen.py         13-state reference over horizon    (MPC_Config)
-mpc_solver.py      convex MPC -> GRFs, every 25 ms    (ConvexMPC, predict_foot_positions)
-swing_traj.py      Bezier swing trajectories + Cheetah 3 footstep terms
-leg_controller.py  stance: -J^T f ; swing: Cartesian PD + feed-forward
-controller.py      wires the above                    (ControllerConfig, LocomotionController)
+structs.py         all configs (MPC_Cfg, GaitCfg, ControllerCfg, SimCfg, ...) + SRB dynamics
+gait.py            GaitScheduler: contacts, swing timing
+foot_place.py      foot placement policies (openloop, Raibert, lipm) + POLICIES registry
+swing_traj.py      Cheetah 3 footstep terms, Bezier swing trajectory
+ref_gen.py         constant-velocity reference, PeriodicReference, ref_gen_periodic
+mpc_controller.py  ConvexMPC (phase variable, period constraint), foot prediction
+leg_controller.py  stance -J^T f + bias + friction comp; swing Cartesian PD + feed-forward
+quad_ctrl.py       QuadrupedController: wires everything, snapshot get_state/set_state
 state.py           MuJoCo state access, robot SRB parameters
-sim_env.py         model (flat floor), sim loop, logging, snapshots
-poincare.py        section, fixed point, return-map Jacobian, eigenvalues
-compare_policies.py  runs poincare.analyze over a set of policies, saves npz + png
+sim_env.py         model from SimCfg, sim loop, logging, snapshots, pushes
+experiment.py      Experiment = SimCfg + ControllerCfg + policy + command; shared CLI
+run.py             one simulation (settings, pushes, plots, record a periodic reference)
+poincare_aug.py    time-augmented Poincare map (touchdown or clock section)
+roa.py             sample-based region of attraction (grid / random / radial)
 ```
 
-Add a foot placement approach: subclass `FootPlacementPolicy` in
-`foot_placement.py`, implement `_raw(inp) -> foothold`, register it in
-`POLICIES`, add it to `POLICY_SET` in `compare_policies.py`.
+## Changing settings
 
-## Marking convention in the original files
+Any config field: `--set section.field=value` (sections `sim mpc gait swing leg ctrl exp`),
+or a JSON file with the same sections (`run.py --dump-config x.json` writes one).
+Shortcuts for the simulator:
 
-`gait.py`, `ref_gen.py`, `state.py`, `swing_traj.py`, `step_interpolator.py`:
+| flag | meaning |
+|---|---|
+| `--stiffness K --damping B` | contact solref = (-K, -B), "direct" mode |
+| `--solref TC DR` | contact solref = (timeconst, dampratio); keep TC >= 2 dt |
+| `--solimp a b c d e` | contact solimp |
+| `--friction MU` | floor + feet sliding friction (MPC mu follows: MU/sqrt(2), `exp.mu_auto`) |
+| `--condim --cone --impratio --integrator --dt` | MuJoCo options |
+| `--obstacles` | keep the bars/stairs of the stock scene (removed by default) |
+| `--set sim.mass_scale=1.2 sim.torque_scale=0.8` | robot changes |
 
-* `# [FIXED]`   a bug fix, with the reason
-* `# [CHANGED]` a changed value/behaviour, with the reason
-* `# [ADDED]`   new code; larger blocks are wrapped in
-  `# ---- [ADDED] begin ----` / `# ---- [ADDED] end ----`
+## MPC: phase variable, period constraint, periodic reference
 
-Files whose header says `[NEW FILE]` / `[NEW CONTENT]` were written from scratch
-(`mpc_solver.py` kept its original imports).
+* Phase `phi_k = phi_0 + k dt / T` is carried along the horizon (`MPCSol.phase`).
+  It does not depend on the forces, so it is not a QP variable; it selects the
+  periodic reference and the constrained step pairs.
+* Period constraint `x_{k+N} = x_k` (+ reference shift for x, y, yaw; v/w rotated
+  by the reference yaw change), N = T/dt. Needs `mpc.h >= N + period_k0` (h=30).
+  * `mpc.period_constraint`: `none` | `soft` (weight `period_weight`) | `hard`
+    (falls back to soft if infeasible)
+  * `mpc.period_pairs`: `last` (x_h = x_{h-N}: last period of the plan is a closed
+    orbit), `section` (pair at a gait-phase boundary), `all` (every step: over-
+    determined, usually infeasible as hard; kept for comparison)
+* Periodic reference: `run.py --record-ref results/ref.npz` records the robot's own
+  cycle; `--periodic-ref results/ref.npz` tracks it. `mpc.periodic_ref_terms`
+  picks the tracked terms; `("z","v")` is recommended (tracking recorded
+  roll/pitch made the MPC re-create leg-induced body motion: pitch doubled).
 
-## Deviations from Cheetah 3 (and why)
+## Time-augmented Poincare map
 
-* **MPC state from whole-robot momentum** (`ControllerConfig.centroidal_state=True`).
-  Go2 legs are ~45% of the mass; swinging legs kick the base velocity around
-  while CoM velocity / angular momentum only change through ground forces.
-  `False` gives the paper's base-link state (works, but tracks speed worse:
-  0.60 vs 0.86 m/s at a 1.0 m/s command).
-* **Composite inertia** of all bodies about the CoM (`state.robot_params`).
-* **Leg bias, joint friction/damping compensation, swing feed-forward**
-  (`LegControlConfig`). Without them the real ground force missed the MPC force
-  by ~20 N vertically and ~4 N/leg horizontally.
-* **Friction pyramid mu = 0.28** = 0.4/sqrt(2): the model's foot friction is 0.4
-  on a round cone.
+State `(x, phi)`, phi = gait clock phase, so the closed loop is autonomous.
+Section `touchdown` (default) = actual FL ground contact: `dphi` (clock phase at
+touchdown) is a coordinate and the return time `tau` is reported. Section
+`clock` = `phi = 0`, the stroboscopic map. Perturbations: 6 base velocity
+components + clock shift. Eigenvalues come from a least-squares fit in reduced
+coordinates (legs' joint states are not in the section); compare policies under
+identical settings, and treat absolute values as estimates (clock and touchdown
+sections give different numbers, e.g. 0.32 vs 0.47).
 
-## Poincare section
+## Region of attraction
 
-Section = touchdown of FL/RR (start of each cycle). Coordinates
-`[z, roll, pitch, vx, vy, vz, wx, wy, wz]` in the heading frame
-(`extended=True` adds FL/RR foot xy relative to the base). Fixed point = mean of
-the last cycles after settling; the Jacobian is fitted by least squares from
-randomly pushed trajectories (eigenvalues), and also estimated column-wise by
-central differences on the velocity coordinates. The fit leaves ~15% residual
-(the legs' joint state is not in the section), so treat eigenvalues as
-estimates; compare policies under identical settings.
+Perturbations at the section, `--cycles` crossings, classified converged / not
+converged / fell. `grid` (2-D slice), `random` (Sobol in a box), `radial`
+(bisection along random directions; assumes the region is star-shaped along each
+direction).
+
+## Marking convention
+
+`[FIXED]` bug fix, `[CHANGED]` changed behaviour/value, `[ADDED]` new code
+(blocks in `---- [ADDED] begin/end ----`), `[REVIEW NOTE]` observation without a
+change. Files headed `[NEW FILE]` were written from scratch.
