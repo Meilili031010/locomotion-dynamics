@@ -25,7 +25,7 @@ class QuadrupedController:
                  cfg: ControllerCfg, foot_placement: FootPlacement,
                  periodic_ref: PeriodicReference | None = None):   # [ADDED]
         self.model = model
-        self.data = data                      # [FIXED] was self.data = self.data (AttributeError)
+        self.data = data
         self.cfg = cfg
         self.foot_placement = foot_placement
         self.periodic_ref = periodic_ref      # [ADDED] used when cfg.mpc_cfg.periodic_ref
@@ -37,8 +37,6 @@ class QuadrupedController:
         assert abs(self.step_per_mpc * self.sim_dt - self.cfg.mpc_cfg.dt) < 1e-9, \
             "mpc.dt must be a multiple of the sim timestep"    # [FIXED] self.cfg.mpc -> mpc_cfg
 
-        # [FIXED] condition was `if self.step_per_mpc:` (always true), which
-        # replaced the value with cfg.step_per_mpc = None.
         if self.cfg.step_per_mpc:
             self.step_per_mpc = self.cfg.step_per_mpc
         self.gait = GaitScheduler(self.cfg.gait_cfg)
