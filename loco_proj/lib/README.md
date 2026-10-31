@@ -11,6 +11,8 @@ rigid body, a one-leg robot), so you can write the Go2 code in `sim/` yourself.
 | `gait_lib.py` | gait clock/phase, contact table, durations, events, contact horizon, standing start, frames, reference trajectories (constant / periodic), foot placement, Bezier swing, policy registry | `gait.py`, `ref_gen.py`, `foot_place.py`, `swing_traj.py` |
 | `controller_lib.py` | stance -J^T f, gravity comp, swing PD + feed-forward, friction comp, limits + actuator order, multi-rate MPC timing, the order of one control step, controller state, config dataclasses, debug checklist | `leg_controller.py`, `quad_ctrl.py` |
 
+`go2_interface_dictionary.md`: Go2 names/indices/limits, a MuJoCo API lookup table, and the list of functions the interface program needs (no code).
+
 Run (needs `mujoco`, `numpy`, `scipy`, `osqp`):
 
 ```bash
