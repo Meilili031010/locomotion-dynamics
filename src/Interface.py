@@ -116,7 +116,6 @@ class Interface:
         tau_cmd = np.clip(tau, -self.tau_limit, self.tau_limit)
         self.d.ctrl[self.act_idx] = tau_cmd.reshape.ravel()
         
-    # ---- [ADDED] ----
 def robot_params(model: mujoco.MjModel, key: int = 0) -> dict:
     """
     Single-rigid-body parameters for the MPC, computed at the keyframe pose.
@@ -159,7 +158,6 @@ def robot_params(model: mujoco.MjModel, key: int = 0) -> dict:
         com_b=Rwb.T @ (com - p_base),
         foot_b=(d.geom_xpos[foot_ids] - p_base) @ Rwb,
     )
-    # ---- [ADDED] end ----
 
 
 if __name__ == "__main__":

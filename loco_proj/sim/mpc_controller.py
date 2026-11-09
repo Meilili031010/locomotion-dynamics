@@ -193,7 +193,7 @@ class ConvexMPC:
             lb = np.concatenate([lb, g])
             ub = np.concatenate([ub, g])
         sol = osqp.OSQP()
-        # [FIXED] sparse.csc_martix -> sparse.csc_matrix (AttributeError on every solve)
+        # [FIXED] sparse.csc_matrix (AttributeError)
         sol.setup(P=sparse.csc_matrix(np.triu(P)), q=q, A=C, l=lb, u=ub, **self.osqp_opt)
         res = sol.solve()
         return res, res.info.status
