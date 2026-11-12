@@ -1,7 +1,7 @@
 from dataclasses import field, dataclass
 from typing import Callable
 from Utils import rot_z
-from Def import LEGS
+from Def import LEGS, SimCfg, SimLog
 
 import mujoco
 import numpy as np
@@ -16,88 +16,7 @@ _INTEGRATORS = {"euler": mujoco.mjtIntegrator.mjINT_EULER,
 _CONES = {"pyramidal": mujoco.mjtCone.mjCONE_PYRAMIDAL,
           "elliptic": mujoco.mjtCone.mjCONE_ELLIPTIC}
 
-@dataclass
-class SimCfg:
-    """
-    MuJoCo settings for one run. None = keep the value from the xml.
 
-    Contact softness (floor <-> feet), MuJoCo solref, two ways:
-        contact_solref = (timeconst, dampratio)   "standard" mode, e.g. (0.02, 1)
-        contact_stiffness / contact_damping       "direct" mode, solref = (-k, -b)
-    The direct mode wins if contact_stiffness is set. Smaller timeconst /
-    larger stiffness = stiffer ground. timeconst should stay >= 2 * timestep.
-    contact_solimp = (dmin, dmax, width, midpoint, power).
-    """
-    xml: str = "/home/mel/ws/unitree_ws/src/unitree_mujoco/unitree_robots/go2/scene.xml"
-    timestep: float = 0.001
-    integrator: str | None = None          # "euler" | "implicitfast" | "implicit" | "rk4"
-    obstacles: bool = False                # keep the bars/stairs of the stock scene
-    gravity: float = -9.81
-    # contact
-    contact_solref: tuple | None = None
-    contact_stiffness: float | None = None
-    contact_damping: float | None = None
-    contact_solimp: tuple | None = None
-    friction: float | None = None          # sliding friction, floor and feet
-    condim: int | None = None              # 1, 3, 4, 6 for the feet
-    cone: str | None = None                # "pyramidal" | "elliptic"
-    impratio: float | None = None
-    noslip_iterations: int | None = None
-    solver_iterations: int | None = None
-    # robot
-    mass_scale: float = 1.0                # scales every body mass + inertia
-    torque_scale: float = 1.0              # scales actuator ctrlrange
-    # initial state
-    init_height_offset: float = 0.0        # extra base height at reset [m]
-
-@dataclass
-class SimLog:
-    t: list = field(default_factory=list)
-    qpos: list = field(default_factory=list)
-    qvel: list = field(default_factory=list)
-    phase: list = field(default_factory=list)
-    x_mpc: list = field(default_factory=list)      # centroidal MPC state (for periodic references)
-    contacts: list = field(default_factory=list)
-    forces: list = field(default_factory=list)
-    footholds: list = field(default_factory=list)
-    tau: list = field(default_factory=list)
-    v_cmd: list = field(default_factory=list)
-    mpc_status: list = field(default_factory=list)
-    period_residual: list = field(default_factory=list)
-
-    def append(self, data, ctrl, v_cmd):
-        info = ctrl.info_leg
-        self.t.append(data.time)
-        self.qpos.append(data.qpos.copy())
-        self.qvel.append(data.qvel.copy())
-        self.phase.append(info["phase"])
-        self.x_mpc.append(ctrl.st.mpc_state_centroidal(ctrl.params["I_body"], ctrl.params["com_b"]))
-        self.contacts.append(info["contacts"].copy())
-        self.forces.append(info["forces"].copy())
-        self.footholds.append(info["foothold"].copy())
-        self.tau.append(info["tau"].copy())
-        self.v_cmd.append(np.asarray(v_cmd, dtype=float))
-        self.mpc_status.append(ctrl.mpc_result.status)
-        self.period_residual.append(ctrl.mpc_result.period_residual)
-
-    def arrays(self) -> dict:
-        return {k: np.asarray(v) for k, v in self.__dict__.items()}
-
-    def save(self, path: str, **extra):
-        np.savez(path, **self.arrays(), **extra)
-
-@dataclass
-class ForcePush:
-    """External force/torque on the base, world frame, during [t0, t0 + duration)."""
-    t0: float
-    duration: float
-    force: tuple = (0.0, 0.0, 0.0)
-    torque: tuple = (0.0, 0.0, 0.0)
-
-    def apply(self, data):
-        on = self.t0 <= data.time < self.t0 + self.duration
-        data.xfrc_applied[1, :3] = self.force if on else 0.0
-        data.xfrc_applied[1, 3:] = self.torque if on else 0.0
 
 def make_model(cfg: SimCfg | None = None):
     """Build (model, data) from SimCfg and reset the robot to standing."""
@@ -290,3 +209,6 @@ def run(model, data, ctrl, duration: float,
             view.close()
             time.sleep(0.1)
     return log, fallen
+
+
+

@@ -1,5 +1,6 @@
 from dataclasses import field, dataclass
 import numpy as np
+from pathlib import Path
 
 NX = 13
 NU = 12
@@ -9,8 +10,10 @@ IDX_P = slice(0, 3)      # position
 IDX_RPY = slice(3, 6)    # [roll, pitch, heading]
 IDX_V = slice(6, 9)      # trans vel
 IDX_W = slice(9, 12)     # angular vel
-IDX_RPY = slice(3, 6)
 IDX_G = 12
+# [FIXED] was Path.cwd(): the model path then depended on the folder you start
+# python from. Repo root = parent of src/.
+PATH = str(Path(__file__).resolve().parents[1])
 
 
 LEGS = ["FL", "FR", "RL", "RR"]
@@ -32,12 +35,23 @@ class GaitCfg:
         [0, 0.5, 0.5, 0],   # FR, RL swing
         [1, 0, 0, 1],   # FL, RR swing
     ], dtype=float))
+    # [ADDED] parametric gait (for gait optimization). If `offsets` is set, the
+    # table is ignored and the schedule is built from
+    #   duty    : stance fraction of the cycle, same for all legs (0 < duty < 1)
+    #   offsets : (4,) lift-off phase of each leg [FL, FR, RL, RR] in [0, 1)
+    # Trot = duty 0.5, offsets (0.5, 0, 0, 0.5) (same as the default table).
+    duty: float | None = None
+    offsets: tuple | None = None
 
     def __post_init__(self):
         self.table = np.asarray(self.table, dtype=float)
         assert self.period > 0
         assert self.table.ndim == 2 and self.table.shape[1] == 4
         assert np.all(self.table >= 0)
+        if self.offsets is not None:
+            self.offsets = tuple(float(o) % 1.0 for o in self.offsets)
+            assert len(self.offsets) == 4, "offsets needs one lift-off phase per leg"
+            assert self.duty is not None and 0.0 < self.duty < 1.0, "duty must be in (0, 1)"
 
 @dataclass
 class SwingTrajectoryCfg:
@@ -62,6 +76,46 @@ class FootPlacementCfg:
     # [ADDED] compute_foot_placement() read footCfg.use_centrifugal, which did
     # not exist (AttributeError with slots=True).
     use_centrifugal: bool = True
+    # [ADDED] for policies that use the MPC plan (e.g. ForceAligned):
+    #   hip_b : (3,) leg "hip point" in the base frame (shoulder x, y; hip z)
+    #   plan  : latest MPC plan (MPCPlan), None before the first solve
+    hip_b: np.ndarray | None = None
+    plan: "MPCPlan | None" = None
+
+
+@dataclass
+class MPCPlan:
+    """
+    [ADDED] What a foot placement policy may read from the latest MPC solve.
+    Row k of every array belongs to MPC step k after the solve time
+    (gait time t_gait0 + k * dt).
+        contacts (h, 4)  bool, planned stance
+        forces   (h, 4, 3) planned ground reaction forces (world, on the robot)
+        X_pred   (h, 13) predicted state x_{k+1} (after applying forces[k])
+    """
+    contacts: np.ndarray
+    forces: np.ndarray
+    X_pred: np.ndarray
+    dt: float
+    t_gait0: float
+    status: str = ""
+
+    def next_stance_rows(self, leg: int) -> np.ndarray:
+        """
+        Rows of the leg's NEXT stance in the plan: the first stance block that
+        comes after a swing block. Empty if it does not start inside the horizon.
+        """
+        c = self.contacts[:, leg]
+        swing = np.flatnonzero(~c)
+        if swing.size == 0:
+            return np.zeros(0, dtype=int)
+        after = np.flatnonzero(c[swing[0]:]) + swing[0]
+        if after.size == 0:
+            return np.zeros(0, dtype=int)
+        k_td = after[0]
+        end = np.flatnonzero(~c[k_td:])
+        k_lo = k_td + end[0] if end.size else len(c)
+        return np.arange(k_td, k_lo)
 
 @dataclass
 class MPC_Cfg:
@@ -75,9 +129,6 @@ class MPC_Cfg:
     mu: float = 0.28
     fz_max: float = 160.0
     fz_min: float = 0.0
-    # [CHANGED] was all ones. Started from the MIT convexMPC weights, then tuned
-    # in sim for Go2 (state layout [p(3), rpy(3), v(3), w(3), g]). Gravity
-    # entry must have zero weight.
     Q_diag: np.ndarray = field(default_factory=lambda: np.array(
         [1.0, 1.0, 50.0,      # p
          10.0, 10.0, 10.0,    # roll, pitch, yaw
@@ -110,6 +161,10 @@ class MPC_Cfg:
     # re-create body motion caused by the swing legs (invisible to its model):
     # pitch swing doubled in tests. ("z", "v") avoids that.
     periodic_ref_terms: tuple = ("z", "roll", "pitch", "v", "w")
+    # [ADDED] leg-axis force alignment cost:  align_weight * sum ||(I - l l^T) f||^2
+    # over stance legs, l = unit vector foot -> hip point (predicted). Pushes the
+    # MPC to plan forces along the leg (no hip moment). 0 = off.
+    align_weight: float = 0.0
     # ---- [ADDED] end ----
 
 
@@ -180,6 +235,15 @@ class ControllerCfg:
     update_foothold_in_swing: bool = True
     step_per_mpc: int | None = None
     centroidal_state: bool = True
+    # [ADDED] For policies that read the MPC plan: after an MPC solve,
+    # recompute the swing footholds from the new plan and solve again, this
+    # many times (fixed-point iteration foothold <-> forces). 0 = use the plan
+    # of the previous solve (one MPC step old).
+    placement_iters: int = 0
+    # [ADDED] "hip point" of each leg used by force alignment (policy + MPC cost):
+    #   "thigh"     : thigh (pitch) joint, above the nominal foot  (no thigh moment)
+    #   "abduction" : hip abduction axis, 9.5 cm further inwards    (no abduction moment)
+    hip_point: str = "thigh"
 
 @dataclass
 class PeriodicReference:
@@ -274,5 +338,88 @@ class PeriodicReference:
 
 # ---- [ADDED] end ----
 
+
+@dataclass
+class SimCfg:
+    """
+    MuJoCo settings for one run. None = keep the value from the xml.
+
+    Contact softness (floor <-> feet), MuJoCo solref, two ways:
+        contact_solref = (timeconst, dampratio)   "standard" mode, e.g. (0.02, 1)
+        contact_stiffness / contact_damping       "direct" mode, solref = (-k, -b)
+    The direct mode wins if contact_stiffness is set. Smaller timeconst /
+    larger stiffness = stiffer ground. timeconst should stay >= 2 * timestep.
+    contact_solimp = (dmin, dmax, width, midpoint, power).
+    """
+    xml: str = PATH + "/unitree_ws/src/unitree_mujoco/unitree_robots/go2/scene.xml"
+    timestep: float = 0.001
+    integrator: str | None = None          # "euler" | "implicitfast" | "implicit" | "rk4"
+    obstacles: bool = False                # keep the bars/stairs of the stock scene
+    gravity: float = -9.81
+    # contact
+    contact_solref: tuple | None = None
+    contact_stiffness: float | None = None
+    contact_damping: float | None = None
+    contact_solimp: tuple | None = None
+    friction: float | None = None          # sliding friction, floor and feet
+    condim: int | None = None              # 1, 3, 4, 6 for the feet
+    cone: str | None = None                # "pyramidal" | "elliptic"
+    impratio: float | None = None
+    noslip_iterations: int | None = None
+    solver_iterations: int | None = None
+    # robot
+    mass_scale: float = 1.0                # scales every body mass + inertia
+    torque_scale: float = 1.0              # scales actuator ctrlrange
+    # initial state
+    init_height_offset: float = 0.0        # extra base height at reset [m]
+
+@dataclass
+class SimLog:
+    t: list = field(default_factory=list)
+    qpos: list = field(default_factory=list)
+    qvel: list = field(default_factory=list)
+    phase: list = field(default_factory=list)
+    x_mpc: list = field(default_factory=list)      # centroidal MPC state (for periodic references)
+    contacts: list = field(default_factory=list)
+    forces: list = field(default_factory=list)
+    footholds: list = field(default_factory=list)
+    tau: list = field(default_factory=list)
+    v_cmd: list = field(default_factory=list)
+    mpc_status: list = field(default_factory=list)
+    period_residual: list = field(default_factory=list)
+
+    def append(self, data, ctrl, v_cmd):
+        info = ctrl.info_leg
+        self.t.append(data.time)
+        self.qpos.append(data.qpos.copy())
+        self.qvel.append(data.qvel.copy())
+        self.phase.append(info["phase"])
+        self.x_mpc.append(ctrl.st.mpc_state_centroidal(ctrl.params["I_body"], ctrl.params["com_b"]))
+        self.contacts.append(info["contacts"].copy())
+        self.forces.append(info["forces"].copy())
+        self.footholds.append(info["foothold"].copy())
+        self.tau.append(info["tau"].copy())
+        self.v_cmd.append(np.asarray(v_cmd, dtype=float))
+        self.mpc_status.append(ctrl.mpc_result.status)
+        self.period_residual.append(ctrl.mpc_result.period_residual)
+
+    def arrays(self) -> dict:
+        return {k: np.asarray(v) for k, v in self.__dict__.items()}
+
+    def save(self, path: str, **extra):
+        np.savez(path, **self.arrays(), **extra)
+
+@dataclass
+class ForcePush:
+    """External force/torque on the base, world frame, during [t0, t0 + duration)."""
+    t0: float
+    duration: float
+    force: tuple = (0.0, 0.0, 0.0)
+    torque: tuple = (0.0, 0.0, 0.0)
+
+    def apply(self, data):
+        on = self.t0 <= data.time < self.t0 + self.duration
+        data.xfrc_applied[1, :3] = self.force if on else 0.0
+        data.xfrc_applied[1, 3:] = self.torque if on else 0.0
 
 

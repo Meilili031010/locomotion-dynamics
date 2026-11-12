@@ -54,7 +54,8 @@ def compute_foot_placement(
     p_s = p_sym(footCfg.v_base, footCfg.t_stance, footCfg.yaw)
     p_f = p_fb(footCfg.v_base, footCfg.v_cmd, footCfg.height, swingCfg.k_fb)
     p_r = p_rot(footCfg.v_cmd, footCfg.r_hip, footCfg.t_stance)
-    p_c = p_centrifugal(footCfg.v_base, footCfg.v_cmd, footCfg.height, G) if footCfg.use_centrifugal else 0.0  # [ADDED]
+    # [FIXED] passed G = -9.81 -> sqrt(h / -9.81) = NaN footholds for the lipm policy
+    p_c = p_centrifugal(footCfg.v_base, footCfg.v_cmd, footCfg.height, -G) if footCfg.use_centrifugal else 0.0
 
     target_xy = p_hip_td + p_s + p_f + p_r + p_c
     target_xy[2] = 0.0   # [FIXED] p_hip carries the hip height; it was added to the terrain z
@@ -133,13 +134,34 @@ def foot_trajectory(
 
     return np.vstack([pos, vel, acc])
 
+def schedule_from_offsets(duty: float, offsets) -> tuple[np.ndarray, np.ndarray]:
+    """
+    [ADDED] Parametric gait -> (ends (n,), swing (n, 4) bool), the same arrays
+    GaitScheduler builds from a table. Leg i swings during
+    [offsets[i], offsets[i] + 1 - duty) (mod 1). Sub-phase boundaries are all
+    lift-off / touchdown phases; unlike the table, all-stance sub-phases are
+    allowed (duty > 0.5 walks).
+    """
+    off = np.mod(np.asarray(offsets, dtype=float), 1.0)
+    sw = 1.0 - duty
+    b = np.concatenate([off, np.mod(off + sw, 1.0), [1.0]])
+    b = np.unique(np.round(b, 12))
+    ends = b[b > 1e-12]
+    starts = np.concatenate([[0.0], ends[:-1]])
+    mid = 0.5 * (starts + ends)
+    swing = np.mod(mid[:, None] - off[None, :], 1.0) < sw
+    return ends, swing
+
+
 class GaitScheduler:
     def __init__(self, cfg: GaitCfg):
         self.cfg = cfg
         self.T = cfg.period
         tab = cfg.table
 
-        if not np.any(tab):
+        if cfg.offsets is not None:                    # [ADDED] parametric gait
+            self.ends, self.swing = schedule_from_offsets(cfg.duty, cfg.offsets)
+        elif not np.any(tab):
             # Whole period is four-leg stance: one sub-phase ending at 1.0
             self.ends = np.array([1.0])
             self.swing = np.zeros((1, 4), dtype=bool)
@@ -163,6 +185,10 @@ class GaitScheduler:
         assert np.all((~self.swing).any(axis=0)), "Every leg needs at least one stance sub-phase"
 
         self._prev = None
+
+    def boundaries(self) -> np.ndarray:
+        """[ADDED] Sub-phase boundaries in seconds within one cycle (0 excluded)."""
+        return self.ends * self.T
 
     def phase(self, t: float) -> float:
         """

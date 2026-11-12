@@ -3,6 +3,10 @@ import numpy as np
 from Def import LEGS, JOINTS, IDX_KEYS, G
 from scipy.spatial.transform import Rotation as R
 class Interface:
+    """
+    Read-only view of the Go2 state + torque output, in LEGS order (FL, FR, RL, RR).
+    Valid after mj_forward / mj_step1. Arrays are copies unless noted.
+    """
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData):
         self.nu = model.nu      # 12 joint actuator
         self.nv = model.nv      # 1 x 6 DOF vel + 12 joint vel
@@ -14,76 +18,103 @@ class Interface:
         self.vadr = model.jnt_dofadr[self.jnt_idx].reshape((4,3))
         self.base_idx = self.m.body("base_link").id
         act_of_joint = {model.actuator_trnid[i, 0]: i for i in range(model.nu)}
-        self.act_idx = np.array([act_of_joint[i] for i in self.jnt_idx])
+        self.act_idx = np.array([act_of_joint[i] for i in self.jnt_idx])   # (12,), LEGS x JOINTS order
         self.tau_limit = model.actuator_ctrlrange[self.act_idx,1].reshape((4,3))
         hip_body = [model.joint(f"{leg}_hip_joint").bodyid for leg in LEGS]
         self.hip_b = model.body_pos[np.ravel(hip_body)].copy()
+        self._M = np.zeros((model.nv, model.nv))
 
     @property
     def base_pose_w(self):
+        """(6,) [x, y, z, roll, pitch, yaw]."""
         q = self.d.qpos[:7]
         rpy = R.from_quat(q[[4,5,6,3]]).as_euler("xyz")
         return np.concatenate([q[:3], rpy])
 
+    # [FIXED] was named R_bw, but xmat is the body -> world rotation R_wb
+    # (v_world = R_wb @ v_body). Renamed so the math reads correctly.
     @property
-    def R_bw(self):
-        return self.d.xmat[self.base_idx].reshape((3,3))
+    def R_wb(self):
+        """(3, 3) base rotation, body -> world."""
+        return self.d.xmat[self.base_idx].reshape((3,3)).copy()
 
     @property
     def base_v_w(self):
-        return np.concatenate([self.R_bw @ self.d.qvel[3:6], self.d.qvel[:3]])
+        """(6,) [v_world (3), w_world (3)]  -- linear first, same order as the MPC state."""
+        # [FIXED] returned [w, v]: QuadrupedController.step() and mpc_state()
+        # read it as [v, w], so foot placement used the angular velocity as
+        # the base velocity and the base-link MPC state had v and w swapped.
+        return np.concatenate([self.d.qvel[:3], self.R_wb @ self.d.qvel[3:6]])
 
     @property
     def jnt_pos(self):
+        """(4, 3) joint angles."""
         return self.d.qpos[self.qadr]
 
     @property
     def jnt_vel(self):
-        return self.d.qpos[self.vadr]
+        """(4, 3) joint velocities."""
+        # [FIXED] read qpos[vadr] (joint angles of the wrong joints); qvel is right.
+        return self.d.qvel[self.vadr]
 
+    # [FIXED] was `jnt_fric`, but qfrc_actuator is the applied actuator torque,
+    # not friction.
     @property
-    def jnt_fric(self):
+    def jnt_tau(self):
+        """(4, 3) torque applied by the motors (after clipping)."""
         return self.d.qfrc_actuator[self.vadr]
 
     @property
     def foot_pos(self):
-        return self.d.geom_xpos[self.foot_geoms_idx]
+        """(4, 3) foot sphere centers, world."""
+        return self.d.geom_xpos[self.foot_geoms_idx].copy()   # [FIXED] copy, not a view
 
     @property
     def foot_jac(self):
-        """nv: body(6) + joint(12)"""
+        """(4, 6, nv) rows [linear (3); angular (3)], world frame. nv: body(6) + joint(12)"""
         Jac = np.zeros((4,6,self.nv))
         jacp = np.zeros((3, self.nv))
         jacr = np.zeros((3, self.nv))
         for i,j in enumerate(self.foot_geoms_idx):
             mujoco.mj_jacGeom(self.m, self.d, jacp,jacr,j)
-            Jac[i, :3], Jac[i, 3:] = jacr, jacp
+            # [FIXED] was (jacr, jacp): LegController takes J[i][:3] as the
+            # LINEAR Jacobian, so stance torques used the rotational one
+            # (the robot fell while standing).
+            Jac[i, :3], Jac[i, 3:] = jacp, jacr
         return Jac
-    
+
     @property
     def foot_vel(self):
-        return self.foot_jac[:,3:, :] @ self.d.qvel
+        """(4, 3) foot velocities, world."""
+        return self.foot_jac[:, :3, :] @ self.d.qvel
 
     @property
     def com_pos(self):
-        return self.data.subtree_com[self.base_idx]
+        """(3,) whole-robot CoM, world."""
+        return self.d.subtree_com[self.base_idx].copy()   # [FIXED] self.data -> self.d
 
     @property
     def hip_w(self):
-        return self.base_pose_w + self.hip_b @ self.R_bw
+        """(4, 3) hip joint positions, world."""
+        # [FIXED] was base_pose_w (6,) + hip_b @ R -> broadcast error.
+        return self.d.qpos[:3] + self.hip_b @ self.R_wb.T
 
     @property
-    def leg_intertia(self):
-        raise NotImplemented
+    def leg_inertia(self):
+        """(4, 3, 3) joint-space mass matrix block of each leg."""
+        # [FIXED] was `raise NotImplemented` (NotImplemented is not an exception)
+        mujoco.mj_fullM(self.m, self.d, self._M)
+        return np.stack([self._M[np.ix_(v, v)] for v in self.vadr])
 
     @property
     def leg_bias(self):
         """(4, 3) gravity + Coriolis"""
         return self.d.qfrc_bias[self.vadr]
 
-    def mpc_state(self) -> np.ndarray:
+    def mpc_state(self, gravity: float = G) -> np.ndarray:
         """(13,) MPC state [p, rpy, v, w_world, g] from the base link (Cheetah 3)."""
-        return np.concatenate([self.base_pose_w, self.base_v_w, [G]])
+        # [FIXED] took no gravity argument, but the controller calls mpc_state(G)
+        return np.concatenate([self.base_pose_w, self.base_v_w, [gravity]])
 
     def mpc_state_centroidal(self, I_body: np.ndarray, com_b: np.ndarray) -> np.ndarray:
         """
@@ -98,7 +129,7 @@ class Interface:
         """
         mujoco.mj_subtreeVel(self.m, self.d)
         b = self.base_idx
-        R = self.R_bw
+        R = self.R_wb
         pose = self.base_pose_w
         p = self.d.subtree_com[b] - R @ com_b
         v = self.d.subtree_linvel[b].copy()
@@ -106,16 +137,19 @@ class Interface:
         w = np.linalg.solve(R @ I_body @ R.T, L)
         return np.concatenate([p, pose[3:], v, w, [G]])
 
+    # TODO (yours): actual contact state / force from MuJoCo, to compare with the plan
     def sim_detect_contact(self):
-        raise NotImplemented
+        raise NotImplementedError   # [FIXED] was `raise NotImplemented`
 
     def sim_get_contact_force(self):
-        raise NotImplemented
+        raise NotImplementedError
 
     def sim_ctrl(self, tau: np.ndarray):
+        """(4, 3) torques in LEGS order -> clipped -> data.ctrl (actuator order FR, FL, RR, RL)."""
         tau_cmd = np.clip(tau, -self.tau_limit, self.tau_limit)
-        self.d.ctrl[self.act_idx] = tau_cmd.reshape.ravel()
-        
+        self.d.ctrl[self.act_idx] = tau_cmd.ravel()   # [FIXED] was tau_cmd.reshape.ravel()
+        return tau_cmd
+
 def robot_params(model: mujoco.MjModel, key: int = 0) -> dict:
     """
     Single-rigid-body parameters for the MPC, computed at the keyframe pose.

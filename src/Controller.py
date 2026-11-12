@@ -1,6 +1,6 @@
-from Def import MPCSol, MPC_Cfg, GaitCfg, LegControllerCfg, FootPlacementCfg
+from Def import MPCSol, MPC_Cfg, GaitCfg, LegControllerCfg, FootPlacementCfg, MPCPlan
 from Def import ControllerCfg, PeriodicReference
-from Def import IDX_P, IDX_RPY, GRAVITY, NX, NU
+from Def import IDX_P, IDX_RPY, G, NX, NU
 from Def import PERIOD_SHIFT_IDX, _PHASE_EPS
 from Utils import rot_z, continuous_dynamics, discretize
 from Interface import Interface, robot_params
@@ -131,10 +131,13 @@ class ConvexMPC:
     # ---- [ADDED] end ----
 
     def solve(self, x0: np.ndarray, X_ref: np.ndarray, r_foot: np.ndarray,
-              contacts: np.ndarray, phase0: float | None = None) -> MPCSol:
+              contacts: np.ndarray, phase0: float | None = None,
+              r_hip: np.ndarray | None = None) -> MPCSol:
         """
         X_ref  (h+1, 13)  reference, row 0 = x0  (ref_gen returns (13, h+1): pass .T)
         phase0            [ADDED] gait phase of x0 (cycles, unwrapped); optional
+        r_hip  (h, 4, 3)  [ADDED] hip point - CoM over the horizon; needed when
+                          cfg.align_weight > 0 (leg line = r_hip - r_foot)
         """
         t_start = time.perf_counter()
         h = self.cfg.h
@@ -158,6 +161,8 @@ class ConvexMPC:
         QSu = Q_stacked[:, None] * Su_a
         P = Su_a.T @ QSu + np.diag(R_stacked)
         q = QSu.T @ err0
+        if self.cfg.align_weight > 0.0 and r_hip is not None:          # [ADDED]
+            P = P + self._align_cost(contacts, r_foot, r_hip)[np.ix_(active, active)]
 
         C, lb, ub = self._constraints(n_contact)
 
@@ -186,6 +191,18 @@ class ConvexMPC:
                       self._phase, resid)                                        # [CHANGED] + phase, residual
 
     # ---- [ADDED] begin ----
+    def _align_cost(self, contacts, r_foot, r_hip):
+        """(12h, 12h) block diagonal: w (I - l l^T) for every stance leg and step."""
+        h = self.cfg.h
+        P = np.zeros((NU * h, NU * h))
+        line = r_hip - r_foot                                   # (h, 4, 3) foot -> hip
+        for k in range(h):
+            for i in np.flatnonzero(contacts[k]):
+                l = line[k, i] / np.linalg.norm(line[k, i])
+                j = NU * k + 3 * i
+                P[j:j + 3, j:j + 3] = self.cfg.align_weight * (np.eye(3) - np.outer(l, l))
+        return P
+
     def _solve_qp(self, P, q, C, lb, ub, G, g, mode):
         """OSQP solve; adds the period rows as a penalty (soft) or equalities (hard)."""
         if mode == "soft":
@@ -210,7 +227,7 @@ class ConvexMPC:
         h = self.cfg.h
         forces = np.zeros((h, 4, 3))
         n = contacts.sum(axis=1, keepdims=True).clip(min=1)
-        forces[..., 2] = contacts * (self.mass * -GRAVITY) / n
+        forces[..., 2] = contacts * (self.mass * -G) / n   # [FIXED] GRAVITY was undefined (NameError)
         return self._result(forces, Sx @ x0, f"fallback({status})", t_start)
 
 def predict_foot_positions(gait: GaitScheduler, t_gait: float, contacts_h: np.ndarray,
@@ -257,10 +274,10 @@ class LegController:
     def __init__(self, state: Interface, cfg: LegControllerCfg = None):
         self.state = state
         self.cfg = cfg if cfg is not None else LegControllerCfg()   # [FIXED] cfg=None crashed at cfg.kp_swing
-        m = state.model
-        self.fric = m.dof_damping[state.leg_dofs]          # viscous damping [N m s/rad]
+        m = state.m
+        self.fric = m.dof_damping[state.vadr]          # viscous damping [N m s/rad]
         # [FIXED] MjModel has no `dof_frictionless`; Coulomb joint friction is dof_frictionloss
-        self.no_fric = m.dof_frictionloss[state.leg_dofs]
+        self.no_fric = m.dof_frictionloss[state.vadr]
         self.M_s = np.zeros((m.nv, m.nv))
 
     def torques(self, contacts: np.ndarray, forces: np.ndarray,
@@ -273,24 +290,24 @@ class LegController:
             returns   (4, 3)      joint torques, 4 x [hip, thigh, calf]
         """
         st, cfg = self.state, self.cfg
-        p_foot = st.foot_positions
-        v_foot = J[:, :3, :] @ st.data.qvel
+        p_foot = st.foot_pos
+        v_foot = J[:, :3, :] @ st.d.qvel
         bias = st.leg_bias      # gravity
-        qdot = st.joint_velocities
+        qdot = st.jnt_vel
         if not contacts.all():                 # [CHANGED] mass matrix only needed for swing legs
-            mujoco.mj_fullM(st.model, st.data, self.M_s)
+            mujoco.mj_fullM(st.m, st.d, self.M_s)   # [FIXED] Interface has .m/.d, not .model/.data
 
         tau = np.zeros((4,3))
         for i in range(4):
             # [FIXED] was J[i][:, dofs] -> (6, 3) incl. the angular rows; Ji.T @ f
             # and solve(Ji, .) need the (3, 3) translational block.
-            Ji = J[i][:3][:, st.leg_dofs[i]]
+            Ji = J[i][:3][:, st.vadr[i]]
             if contacts[i]:
                 tau[i] += -Ji.T @ forces[i] + bias[i]
             else:
                 f = cfg.kp_swing * (swing_ref[i,0] - p_foot[i]) + cfg.kd_swing * (swing_ref[i,1] - v_foot[i])
                 tau[i] = Ji.T @ f
-                idx = st.leg_dofs[i]
+                idx = st.vadr[i]
                 M_leg = self.M_s[np.ix_(idx, idx)]
                 tau[i] += M_leg @ np.linalg.solve(Ji, swing_ref[i, 2]) + bias[i]
             # [FIXED] joint damping/friction compensation was inside the swing
@@ -301,8 +318,7 @@ class LegController:
         return np.clip(tau, -st.tau_limit, st.tau_limit)
 
     def command(self, tau: np.ndarray):
-        # [FIXED] attribute is self.state (self.st does not exist)
-        self.state.data.ctrl[self.state.act_idx.reshape(-1)] = tau.reshape(-1)
+        self.state.sim_ctrl(tau)   # [CHANGED] one place writes data.ctrl (clip + actuator order)
 
 class QuadrupedController:
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData,
@@ -330,6 +346,20 @@ class QuadrupedController:
         self.leg = LegController(self.st, self.cfg.leg_cfg)
         if self.cfg.mpc_cfg.periodic_ref and self.periodic_ref is None:      # [ADDED]
             raise ValueError("mpc_cfg.periodic_ref=True needs a PeriodicReference")
+        # [ADDED] hip point per leg in the base frame (shoulder x, y from the
+        # nominal foot; z of the hip joint). Given to foot placement policies.
+        self.hip_point_b = self.params["foot_b"].copy()
+        self.hip_point_b[:, 2] = self.st.hip_b[:, 2]
+        if self.cfg.hip_point == "abduction":
+            self.hip_point_b[:, 1] = self.st.hip_b[:, 1]
+        elif self.cfg.hip_point != "thigh":
+            raise ValueError(f"hip_point must be thigh/abduction, got {self.cfg.hip_point}")
+        # [ADDED] contact switches must fall on MPC steps (see README)
+        solve_dt = self.step_per_mpc * self.sim_dt
+        off = np.mod(self.gait.boundaries() / solve_dt + 0.5, 1.0) - 0.5
+        if np.any(np.abs(off) > 1e-6):
+            print(f"warning: gait boundaries {np.round(self.gait.boundaries(), 4)} s are not "
+                  f"multiples of the MPC step {solve_dt} s; contacts switch between MPC steps")
         self.reset()
 
     def reset(self):
@@ -337,7 +367,7 @@ class QuadrupedController:
         # step() method, so ctrl.step(v) raised "'int' object is not callable".
         self.n_step = 0   # time step count
         self.prev_contacts = np.ones(4, dtype=bool)
-        p = self.st.foot_positions
+        p = self.st.foot_pos
         self.lift_off = p.copy()              # lift-off positions (4, 3)
         self.foothold = p.copy()
         self.forces = np.zeros((4,3))
@@ -349,6 +379,7 @@ class QuadrupedController:
         self.clock_offset = 0.0
         # [ADDED] index of the last MPC solve on the gait-clock grid (see step())
         self.mpc_tick = None
+        self.plan = None                      # [ADDED] MPCPlan of the last solve (foot placement input)
         self.info_mpc = self.init_mpc_info()
         self.info_leg = self.init_leg_info()
 
@@ -361,6 +392,7 @@ class QuadrupedController:
         self.mpc_result.copy_into(info_dict["mpc_result"])
         info_dict["clock_offset"] = self.clock_offset     # [ADDED]
         info_dict["mpc_tick"] = self.mpc_tick             # [ADDED]
+        info_dict["plan"] = self.plan                     # [ADDED] never modified in place, so a reference is enough
         return info_dict                                  # [ADDED] convenience
 
     def set_state(self, s: dict):
@@ -372,6 +404,7 @@ class QuadrupedController:
         s["mpc_result"].copy_into(self.mpc_result)
         self.clock_offset = s.get("clock_offset", 0.0)    # [ADDED]
         self.mpc_tick = s.get("mpc_tick", None)           # [ADDED]
+        self.plan = s.get("plan", None)                   # [ADDED]
 
     def init_mpc_info(self) -> dict:
         return {
@@ -383,6 +416,7 @@ class QuadrupedController:
             "mpc_result": MPCSol.empty_like(self.mpc_result),
             "clock_offset": 0.0,                          # [ADDED]
             "mpc_tick": None,                             # [ADDED]
+            "plan": None,                                 # [ADDED]
         }
 
     def init_leg_info(self) -> dict:
@@ -444,18 +478,49 @@ class QuadrupedController:
         t_gait = self.get_gait_time(self.t_sim)           # [FIXED] self.t does not exist
         return -1 if t_gait < -1e-9 else self.gait.cycle_index(t_gait)
 
+    def _update_footholds(self, contacts, liftoff, elapsed, p_foot, base_pose,
+                          v_base, w_base, v_cmd_w, force: bool = False):
+        """
+        [CHANGED] (moved out of step()) Stance legs: foothold = current foot.
+        Swing legs: ask the foot placement policy, at lift-off, or every step
+        if cfg.update_foothold_in_swing (or force=True). The policy gets the
+        latest MPC plan in FootPlacementCfg.plan.
+        """
+        cfg = self.cfg
+        yaw = base_pose[5]
+        Rz = rot_z(yaw)
+        p_hip_b = self.params["foot_b"]
+        for i in range(4):
+            if contacts[i]:
+                self.foothold[i] = p_foot[i]
+                continue
+            if not (liftoff[i] or cfg.update_foothold_in_swing or force):   # [FIXED] used positions as a bool
+                continue
+            r_hip = Rz @ np.array([p_hip_b[i,0], p_hip_b[i,1], 0.])
+            t_swing = self.gait.swing_duration(i)
+            self.foothold[i] = self.foot_placement(
+                FootPlacementCfg(
+                leg=i, p_hip=base_pose[:3] + r_hip, r_hip=r_hip,
+                v_base=v_base, w_base=w_base, v_cmd=v_cmd_w,
+                height=base_pose[2], yaw=yaw,
+                t_stance=self.gait.stance_duration(i), t_swing=t_swing,
+                t_swing_remaining=max(t_swing - elapsed[i], 0.0),
+                hip_b=self.hip_point_b[i], plan=self.plan)
+            )
+
     def step(self, v_cmd_b: np.ndarray) -> np.ndarray:
         st = self.st
         t_sim = self.t_sim
         cfg = self.cfg
         v_cmd_b = np.asarray(v_cmd_b, dtype=float)        # [ADDED] lists/tuples
-        base_pose = st.base_pose
+        base_pose = st.base_pose_w
         yaw = base_pose[5]
         Rz = rot_z(yaw)
-        v_base = st.base_lin_vel_world
-        w_base = st.base_ang_vel_world
-        p_foot = st.foot_positions
-        J = st.foot_jacobians                             # [ADDED] LegController.torques needs J
+        V = st.base_v_w
+        v_base = V[:3]
+        w_base = V[3:]
+        p_foot = st.foot_pos
+        J = st.foot_jac                           # [ADDED] LegController.torques needs J
         v_cmd_w = np.array([*(Rz[:2, :2] @ v_cmd_b[:2]), v_cmd_b[2]])
 
         contacts = self.get_contacts(t_sim)
@@ -470,22 +535,8 @@ class QuadrupedController:
         t_gait = self.get_gait_time(t_sim)
         elapsed = self.gait.swing_elapsed(t_gait) if t_gait >= -_PHASE_EPS else np.zeros(4)
         p_hip_b = self.params["foot_b"]
-        for i in range(4):
-            if contacts[i]:
-                self.foothold[i] = p_foot[i]
-                continue
-            if not (liftoff[i] or cfg.update_foothold_in_swing):   # [FIXED] used positions as a bool
-                continue
-            r_hip = Rz @ np.array([p_hip_b[i,0], p_hip_b[i,1], 0.])
-            t_swing = self.gait.swing_duration(i)
-            self.foothold[i] = self.foot_placement(
-                FootPlacementCfg(
-                leg=i, p_hip=base_pose[:3] + r_hip, r_hip=r_hip,
-                v_base=v_base, w_base=w_base, v_cmd=v_cmd_w,
-                height=base_pose[2], yaw=yaw,
-                t_stance=self.gait.stance_duration(i), t_swing=t_swing,
-                t_swing_remaining=max(t_swing - elapsed[i], 0.0))
-            )
+        foot_args = (contacts, liftoff, elapsed, p_foot, base_pose, v_base, w_base, v_cmd_w)
+        self._update_footholds(*foot_args)
 
         terrain_z = p_terrain(None)[2]
 
@@ -502,9 +553,9 @@ class QuadrupedController:
         if tick != self.mpc_tick:
             self.mpc_tick = tick
             if cfg.centroidal_state:
-                x0 = st.mpc_state_centroidal(self.params["I_body"], self.params["com_b"], GRAVITY)
+                x0 = st.mpc_state_centroidal(self.params["I_body"], self.params["com_b"])
             else:
-                x0 = st.mpc_state(GRAVITY)
+                x0 = st.mpc_state(G)
             phase0 = self.get_phase(t_sim)                                   # [ADDED]
             if cfg.mpc_cfg.periodic_ref:                                     # [ADDED]
                 X_ref = ref_gen_periodic(x0, phase0, v_cmd_b, cfg.mpc_cfg, self.periodic_ref)
@@ -512,6 +563,9 @@ class QuadrupedController:
                 X_ref = ref_gen(x0, v_cmd_b, cfg.mpc_cfg)
             X_ref = X_ref.T   # [FIXED] ref_gen returns (13, h+1); ConvexMPC.solve asserts (h+1, 13)
             contacts_horizon = self.get_contacts_horizon(t_sim)
+            # [ADDED] predicted hip point - CoM (for the MPC alignment cost)
+            r_hip = np.stack([(self.hip_point_b - self.params["com_b"]) @ rot_z(xr[5]).T
+                              for xr in X_ref[1:]])
             foot_prediction = predict_foot_positions(
                 self.gait, t_gait, contacts_horizon, p_foot, self.foothold,
                 X_ref, p_hip_b, self.params["com_b"], terrain_z
@@ -519,7 +573,21 @@ class QuadrupedController:
             # [FIXED] was MPCSol.copy_into(self.mpc_result, new) = copy the OLD
             # result into the new one; the controller never saw a new solution.
             sol = self.mpc.solve(x0, X_ref, foot_prediction, contacts_horizon,
-                                 phase0=phase0)                              # [CHANGED] + phase0
+                                 phase0=phase0, r_hip=r_hip)                 # [CHANGED] + phase0, r_hip
+            self.plan = MPCPlan(contacts_horizon, sol.forces, sol.X_pred,
+                                cfg.mpc_cfg.dt, t_gait, sol.status)          # [ADDED]
+            # [ADDED] fixed-point iteration for plan-aware placement policies:
+            # new plan -> new swing footholds -> new forces ...
+            if getattr(self.foot_placement, "uses_plan", False):
+                for _ in range(cfg.placement_iters):
+                    self._update_footholds(*foot_args, force=True)
+                    foot_prediction = predict_foot_positions(
+                        self.gait, t_gait, contacts_horizon, p_foot, self.foothold,
+                        X_ref, p_hip_b, self.params["com_b"], terrain_z)
+                    sol = self.mpc.solve(x0, X_ref, foot_prediction, contacts_horizon,
+                                         phase0=phase0, r_hip=r_hip)
+                    self.plan = MPCPlan(contacts_horizon, sol.forces, sol.X_pred,
+                                        cfg.mpc_cfg.dt, t_gait, sol.status)
             sol.copy_into(self.mpc_result)
             np.copyto(self.forces, self.mpc_result.forces[0])   # [CHANGED] copy, not a view into mpc_result
 
