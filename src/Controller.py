@@ -276,7 +276,7 @@ class LegController:
         self.cfg = cfg if cfg is not None else LegControllerCfg()   # [FIXED] cfg=None crashed at cfg.kp_swing
         m = state.m
         self.fric = m.dof_damping[state.vadr]          # viscous damping [N m s/rad]
-        # [FIXED] MjModel has no `dof_frictionless`; Coulomb joint friction is dof_frictionloss
+        # [FIXED] Coulomb joint friction is dof_frictionloss
         self.no_fric = m.dof_frictionloss[state.vadr]
         self.M_s = np.zeros((m.nv, m.nv))
 
@@ -299,8 +299,6 @@ class LegController:
 
         tau = np.zeros((4,3))
         for i in range(4):
-            # [FIXED] was J[i][:, dofs] -> (6, 3) incl. the angular rows; Ji.T @ f
-            # and solve(Ji, .) need the (3, 3) translational block.
             Ji = J[i][:3][:, st.vadr[i]]
             if contacts[i]:
                 tau[i] += -Ji.T @ forces[i] + bias[i]
@@ -310,15 +308,13 @@ class LegController:
                 idx = st.vadr[i]
                 M_leg = self.M_s[np.ix_(idx, idx)]
                 tau[i] += M_leg @ np.linalg.solve(Ji, swing_ref[i, 2]) + bias[i]
-            # [FIXED] joint damping/friction compensation was inside the swing
-            # branch only. Stance legs need it most: uncompensated it removed
-            # ~4 N/leg of the MPC's horizontal force (see earlier version).
+
             tau[i] += self.fric[i] * qdot[i] + self.no_fric[i] * np.tanh(qdot[i] / cfg.jnt_fric_coeff)
 
         return np.clip(tau, -st.tau_limit, st.tau_limit)
 
     def command(self, tau: np.ndarray):
-        self.state.sim_ctrl(tau)   # [CHANGED] one place writes data.ctrl (clip + actuator order)
+        self.state.sim_ctrl(tau)
 
 class QuadrupedController:
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData,
@@ -340,7 +336,7 @@ class QuadrupedController:
         if self.cfg.step_per_mpc:
             self.step_per_mpc = self.cfg.step_per_mpc
         self.gait = GaitScheduler(self.cfg.gait_cfg)
-        # [FIXED] ConvexMPC needs the inertia; [ADDED] gait period for the phase variable
+        # [ADDED] gait period for the phase variable
         self.mpc = ConvexMPC(self.cfg.mpc_cfg, self.params["mass"], self.params["I_body"],
                              period=self.cfg.gait_cfg.period)
         self.leg = LegController(self.st, self.cfg.leg_cfg)
@@ -524,10 +520,6 @@ class QuadrupedController:
         v_cmd_w = np.array([*(Rz[:2, :2] @ v_cmd_b[:2]), v_cmd_b[2]])
 
         contacts = self.get_contacts(t_sim)
-        # [FIXED] lift-off events: was written into self.liftoff (undefined) and
-        # mixed with the lift-off *positions* self.lift_off; positions were never
-        # recorded and prev_contacts never updated, so swing legs started their
-        # trajectory from the initial foot position forever.
         liftoff = ~contacts & self.prev_contacts
         self.lift_off[liftoff] = p_foot[liftoff]
         self.prev_contacts = contacts

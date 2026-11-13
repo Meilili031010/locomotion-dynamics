@@ -2,9 +2,6 @@ import numpy as np
 from Def import GaitCfg,SwingTrajectoryCfg, FootPlacementCfg
 from Def import _PHASE_EPS, LEGS, G
 
-#################
-# Swing
-#################
 def p_sym(v_base: np.ndarray, t_stance: float, heading: float = 0.0) -> np.ndarray:
     out = np.zeros(3)
     out[:2] = v_base[:2] * (t_stance / 2.0)
@@ -25,7 +22,7 @@ def p_rot(v_cmd: np.ndarray, r_hip: np.ndarray, t_stance: float) -> np.ndarray:
 
 
 def p_terrain(coords: np.ndarray) -> np.ndarray:
-    # 0.022 = Go2 foot sphere radius, i.e. foot-center height on flat ground
+    # 0.022 = Go2 foot sphere radius
     return np.array([0.0, 0.0, 0.022])
 
 
@@ -54,11 +51,10 @@ def compute_foot_placement(
     p_s = p_sym(footCfg.v_base, footCfg.t_stance, footCfg.yaw)
     p_f = p_fb(footCfg.v_base, footCfg.v_cmd, footCfg.height, swingCfg.k_fb)
     p_r = p_rot(footCfg.v_cmd, footCfg.r_hip, footCfg.t_stance)
-    # [FIXED] passed G = -9.81 -> sqrt(h / -9.81) = NaN footholds for the lipm policy
     p_c = p_centrifugal(footCfg.v_base, footCfg.v_cmd, footCfg.height, -G) if footCfg.use_centrifugal else 0.0
 
     target_xy = p_hip_td + p_s + p_f + p_r + p_c
-    target_xy[2] = 0.0   # [FIXED] p_hip carries the hip height; it was added to the terrain z
+    target_xy[2] = 0.0
     target_z = p_terrain(target_xy)
 
     return target_xy + target_z
@@ -87,7 +83,7 @@ def foot_trajectory(
     p0: np.ndarray,
     pf: np.ndarray,
     cfg: SwingTrajectoryCfg,
-    t_swing: float = None,   # [ADDED] swing time from the gait; falls back to cfg.t_swing
+    t_swing: float = None,
 ) -> np.ndarray:
     """
         Returns (3, 3): rows [pos; vel; acc], world frame.

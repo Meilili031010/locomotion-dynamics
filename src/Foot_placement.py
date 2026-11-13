@@ -10,8 +10,6 @@ class FootPlacement:
     def __init__(self, max_stride: float = 0.2):
         self.max_stride = max_stride
 
-    # [FIXED] was `__call`: Python name-mangles it to _FootPlacement__call, so
-    # policy(cfg) raised "object is not callable".
     def __call__(self, cfg: FootPlacementCfg) -> np.ndarray:
         p = np.array(self._raw(cfg), dtype=float)
         hip_td = _hip_at_touchdown(cfg)
@@ -47,16 +45,14 @@ class Raibert(FootPlacement):
     def _raw(self, cfg):
         p = _hip_at_touchdown(cfg)
         p[:2] += cfg.v_base[:2] * cfg.t_stance / 2.
-        p[:2] += self.k * (cfg.v_base[:2] - cfg.v_cmd[:2])   # [FIXED] v_cmd is (3,) [vx, vy, wz]: (2,) - (3,) broadcast error
+        p[:2] += self.k * (cfg.v_base[:2] - cfg.v_cmd[:2])
         return p
 
-# [REVIEW NOTE] This is the Cheetah 3 heuristic (symmetry + velocity feedback +
-# yaw + centrifugal terms), not a LIPM / capture-point law. With k=None the
-# feedback gain becomes sqrt(h/g), which is the LIPM capture-point gain.
+
 class lipm(FootPlacement):
     def __init__(self, k: float = 0.03, max_offset: float = 0.2):
         super().__init__(max_offset)
-        self.swing_cfg = SwingTrajectoryCfg(k_fb=k)   # [FIXED] class name
+        self.swing_cfg = SwingTrajectoryCfg(k_fb=k)
         self.name = f"lipm_k{k}"                     # [CHANGED] gain in the name
 
     def _raw(self, cfg):
@@ -131,16 +127,10 @@ class ForceAligned(FootPlacement):
         p[2] = z0
         return p
 
-
-# Name -> constructor, so run/analysis scripts (and worker processes) can build
-# a policy from plain data: POLICIES["raibert"](k=0.1)
-# To add a method: subclass FootPlacement, implement _raw(cfg) -> (3,) world
-# foothold (cfg: FootPlacementCfg, incl. cfg.plan), set uses_plan = True if it
-# reads the plan, and register it here. It is then usable as --policy NAME.
 POLICIES = {
     "openloop": lambda **kw: openloop(**kw),
     "raibert": lambda **kw: Raibert(**kw),
     "lipm": lambda **kw: lipm(**kw),
     "force_aligned": lambda **kw: ForceAligned(**kw),
 }
-# ---- [ADDED] end ----
+

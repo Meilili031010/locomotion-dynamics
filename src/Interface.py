@@ -31,8 +31,6 @@ class Interface:
         rpy = R.from_quat(q[[4,5,6,3]]).as_euler("xyz")
         return np.concatenate([q[:3], rpy])
 
-    # [FIXED] was named R_bw, but xmat is the body -> world rotation R_wb
-    # (v_world = R_wb @ v_body). Renamed so the math reads correctly.
     @property
     def R_wb(self):
         """(3, 3) base rotation, body -> world."""
@@ -57,8 +55,6 @@ class Interface:
         # [FIXED] read qpos[vadr] (joint angles of the wrong joints); qvel is right.
         return self.d.qvel[self.vadr]
 
-    # [FIXED] was `jnt_fric`, but qfrc_actuator is the applied actuator torque,
-    # not friction.
     @property
     def jnt_tau(self):
         """(4, 3) torque applied by the motors (after clipping)."""
@@ -67,7 +63,7 @@ class Interface:
     @property
     def foot_pos(self):
         """(4, 3) foot sphere centers, world."""
-        return self.d.geom_xpos[self.foot_geoms_idx].copy()   # [FIXED] copy, not a view
+        return self.d.geom_xpos[self.foot_geoms_idx].copy()
 
     @property
     def foot_jac(self):
@@ -77,9 +73,6 @@ class Interface:
         jacr = np.zeros((3, self.nv))
         for i,j in enumerate(self.foot_geoms_idx):
             mujoco.mj_jacGeom(self.m, self.d, jacp,jacr,j)
-            # [FIXED] was (jacr, jacp): LegController takes J[i][:3] as the
-            # LINEAR Jacobian, so stance torques used the rotational one
-            # (the robot fell while standing).
             Jac[i, :3], Jac[i, 3:] = jacp, jacr
         return Jac
 
@@ -96,13 +89,11 @@ class Interface:
     @property
     def hip_w(self):
         """(4, 3) hip joint positions, world."""
-        # [FIXED] was base_pose_w (6,) + hip_b @ R -> broadcast error.
         return self.d.qpos[:3] + self.hip_b @ self.R_wb.T
 
     @property
     def leg_inertia(self):
         """(4, 3, 3) joint-space mass matrix block of each leg."""
-        # [FIXED] was `raise NotImplemented` (NotImplemented is not an exception)
         mujoco.mj_fullM(self.m, self.d, self._M)
         return np.stack([self._M[np.ix_(v, v)] for v in self.vadr])
 
@@ -137,9 +128,18 @@ class Interface:
         w = np.linalg.solve(R @ I_body @ R.T, L)
         return np.concatenate([p, pose[3:], v, w, [G]])
 
-    # TODO (yours): actual contact state / force from MuJoCo, to compare with the plan
-    def sim_detect_contact(self):
-        raise NotImplementedError   # [FIXED] was `raise NotImplemented`
+    def sim_detect_contact(self) -> np.ndarray:
+        contacts = np.zeros((self.d.ncon,))
+        for i in range(self.d.ncon):
+            contact = self.d.contact[i]
+            contacts[i] = contact.geom1
+            geom1_name = mujoco.mj_id2name(self.m, mujoco.mjtObj.mjOBJ_GEOM, contact.geom1)
+            geom2_name = mujoco.mj_id2name(self.m, mujoco.mjtObj.mjOBJ_GEOM, contact.geom2)
+            pos = contact.pos
+            dist = contact.dist
+            normal_force = self.d.efc_force[contact.efc_address] if contact.efc_address >= 0 else 0.0
+            print(f"[{i}] {geom1_name} <-> {geom2_name}, position: {np.round(pos, 4)}, distance: {dist:.5f}, normal force: {normal_force:.2f} N")
+        return contacts
 
     def sim_get_contact_force(self):
         raise NotImplementedError
@@ -147,7 +147,7 @@ class Interface:
     def sim_ctrl(self, tau: np.ndarray):
         """(4, 3) torques in LEGS order -> clipped -> data.ctrl (actuator order FR, FL, RR, RL)."""
         tau_cmd = np.clip(tau, -self.tau_limit, self.tau_limit)
-        self.d.ctrl[self.act_idx] = tau_cmd.ravel()   # [FIXED] was tau_cmd.reshape.ravel()
+        self.d.ctrl[self.act_idx] = tau_cmd.ravel()
         return tau_cmd
 
 def robot_params(model: mujoco.MjModel, key: int = 0) -> dict:
